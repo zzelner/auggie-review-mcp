@@ -1,0 +1,49 @@
+{
+  "name": "auggie-review-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for on-demand code review via the Auggie CLI — no PR required",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "auggie-review-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "augment",
+    "auggie",
+    "code-review",
+    "ai",
+    "claude",
+    "cursor"
+  ],
+  "author": "OuterSignal",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zzelner/auggie-review-mcp"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "examples"
+  ]
+}
