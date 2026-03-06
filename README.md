@@ -20,6 +20,8 @@ npm install -g @augmentcode/auggie
 auggie login
 ```
 
+**Note:** The MCP server runs on Node.js 18+. The auggie CLI requires Node.js 22+.
+
 ## Quick Start
 
 ### Option 1: npx (no install)
@@ -86,7 +88,7 @@ npm run build
 
 | Tool | Description | Use When |
 |------|-------------|----------|
-| `review_branch_ref` | Review a remote branch/PR (primary tool) | Reviewing a PR or feature branch |
+| `review_branch_ref` | Review any branch or PR (primary tool) | Reviewing a PR or feature branch |
 | `review_diff` | Review uncommitted/staged changes | Before committing |
 | `review_branch` | Review current branch vs base | Before creating a PR |
 | `review_files` | Review specific files (full contents) | Targeted file review |
@@ -145,7 +147,11 @@ review_files({
 ### `review_pr_ready` — Pre-PR Quality Gate
 
 ```
-review_pr_ready({ base: "main" })
+review_pr_ready({
+  base: "main",
+  files_filter: "src/**/*.ts",
+  custom_instructions: "Focus on authentication changes"
+})
 ```
 
 Returns a structured report with a **PASS / PASS WITH COMMENTS / FAIL** verdict.
@@ -231,7 +237,7 @@ Two review patterns:
 | `WORKSPACE_ROOT` | Yes | — | Repository root path |
 | `AUGGIE_BIN` | No | `auggie` | Path to auggie binary |
 
-Both can also be set via `.auggie-review.json` settings.
+`AUGGIE_BIN` can also be set via `.auggie-review.json` settings (`settings.auggie_bin`). `WORKSPACE_ROOT` must always be set as an environment variable.
 
 ## Timing Expectations
 

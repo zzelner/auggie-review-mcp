@@ -75,6 +75,17 @@ interface AuggieReviewConfig {
   };
 }
 
+const ConfigSchema = z.object({
+  review_types: z.record(z.string(), z.string()).optional(),
+  settings: z
+    .object({
+      timeout_ms: z.number().positive().optional(),
+      max_diff_bytes: z.number().positive().optional(),
+      auggie_bin: z.string().optional(),
+    })
+    .optional(),
+});
+
 let cachedConfig: AuggieReviewConfig | null = null;
 
 async function loadConfig(workspaceRoot: string): Promise<AuggieReviewConfig> {
@@ -83,7 +94,8 @@ async function loadConfig(workspaceRoot: string): Promise<AuggieReviewConfig> {
   const configPath = resolvePath(workspaceRoot, '.auggie-review.json');
   try {
     const raw = await readFile(configPath, 'utf-8');
-    cachedConfig = JSON.parse(raw) as AuggieReviewConfig;
+    const parsed = ConfigSchema.safeParse(JSON.parse(raw));
+    cachedConfig = parsed.success ? parsed.data : {};
     return cachedConfig;
   } catch {
     cachedConfig = {};
@@ -329,7 +341,7 @@ function getReviewHint(
     return firstLine.length > 200 ? firstLine.slice(0, 200) + '...' : firstLine;
   }
 
-  const defaultHints: Record<string, string> = {
+  const defaultHints: Record<DefaultReviewType, string> = {
     general:
       'Focus on bugs, security issues, code quality, and architecture.',
     security:
@@ -343,7 +355,9 @@ function getReviewHint(
       'Focus on component quality, accessibility, error handling, and responsive design.',
   };
 
-  return defaultHints[reviewType] || defaultHints.general;
+  return isDefaultReviewType(reviewType)
+    ? defaultHints[reviewType]
+    : defaultHints.general;
 }
 
 // ============================================================================
@@ -414,12 +428,18 @@ function execCommand(
       proc.stdin.end();
     }
 
+    let settled = false;
+
     proc.on('close', (code) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       resolve({ stdout, stderr, exitCode: code ?? 1 });
     });
 
     proc.on('error', (err: unknown) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       if (err instanceof Error && err.name === 'AbortError') {
         resolve({
@@ -565,11 +585,18 @@ async function runReview(
 // Shared Annotations
 // ============================================================================
 
-const READ_ONLY_ANNOTATIONS = {
+const REVIEW_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,
-  idempotentHint: true,
-  openWorldHint: false,
+  idempotentHint: false, // LLM output is non-deterministic
+  openWorldHint: true, // Calls Augment's cloud API
+} as const;
+
+const CHECK_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true, // Version/auth check IS idempotent
+  openWorldHint: true, // Auth check calls Augment's API
 } as const;
 
 // ============================================================================
@@ -609,17 +636,19 @@ server.registerTool(
           'Which changes to review: "staged" (git diff --cached), ' +
           '"unstaged" (git diff), or "both" (git diff HEAD)',
         ),
-      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
+      review_type: z.string().max(500).default('general').describe(REVIEW_TYPE_DESC),
       files_filter: z
         .string()
+        .max(500)
         .optional()
         .describe('Git pathspec to filter files (e.g., "src/**/*.go", "lib/**/*.ts")'),
       custom_instructions: z
         .string()
+        .max(100_000)
         .optional()
         .describe('Additional review instructions to append to the prompt'),
     },
-    annotations: READ_ONLY_ANNOTATIONS,
+    annotations: REVIEW_ANNOTATIONS,
   },
   async ({ diff_source, review_type, files_filter, custom_instructions }) => {
     const cwd = getWorkspaceRoot();
@@ -657,12 +686,12 @@ server.registerTool(
       'Use this when you are already checked out on the feature branch. ' +
       'Requires being on the feature branch (not main). No PR needed.',
     inputSchema: {
-      base: z.string().default('main').describe('Base branch to compare against (default: main)'),
-      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
-      files_filter: z.string().optional().describe('Git pathspec to filter reviewed files'),
-      custom_instructions: z.string().optional().describe('Additional review instructions'),
+      base: z.string().max(500).default('main').refine(v => !v.startsWith('-'), 'Must not start with a dash').describe('Base branch to compare against (default: main)'),
+      review_type: z.string().max(500).default('general').describe(REVIEW_TYPE_DESC),
+      files_filter: z.string().max(500).optional().describe('Git pathspec to filter reviewed files'),
+      custom_instructions: z.string().max(100_000).optional().describe('Additional review instructions'),
     },
-    annotations: READ_ONLY_ANNOTATIONS,
+    annotations: REVIEW_ANNOTATIONS,
   },
   async ({ base, review_type, files_filter, custom_instructions }) => {
     const cwd = getWorkspaceRoot();
@@ -708,20 +737,22 @@ server.registerTool(
       'Use git_ref to review files from any branch/tag/commit without checking it out.',
     inputSchema: {
       paths: z
-        .array(z.string())
+        .array(z.string().max(1000))
         .min(1)
         .describe('File paths to review (relative to workspace root)'),
       git_ref: z
         .string()
+        .max(500)
+        .refine(v => !v.startsWith('-'), 'Must not start with a dash')
         .optional()
         .describe(
           'Git ref to read files from (e.g., "origin/feature-branch", "HEAD~3"). ' +
           'Files are read via "git show ref:path" instead of from disk.',
         ),
-      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
-      custom_instructions: z.string().optional().describe('Additional review instructions'),
+      review_type: z.string().max(500).default('general').describe(REVIEW_TYPE_DESC),
+      custom_instructions: z.string().max(100_000).optional().describe('Additional review instructions'),
     },
-    annotations: READ_ONLY_ANNOTATIONS,
+    annotations: REVIEW_ANNOTATIONS,
   },
   async ({ paths, git_ref, review_type, custom_instructions }) => {
     const cwd = getWorkspaceRoot();
@@ -782,11 +813,11 @@ server.registerTool(
       'Returns a structured report with PASS/FAIL verdict. ' +
       'Requires being on the feature branch.',
     inputSchema: {
-      base: z.string().default('main').describe('Base branch to compare against'),
-      files_filter: z.string().optional().describe('Git pathspec to filter files'),
-      custom_instructions: z.string().optional().describe('Additional review instructions to include'),
+      base: z.string().max(500).default('main').refine(v => !v.startsWith('-'), 'Must not start with a dash').describe('Base branch to compare against'),
+      files_filter: z.string().max(500).optional().describe('Git pathspec to filter files'),
+      custom_instructions: z.string().max(100_000).optional().describe('Additional review instructions to include'),
     },
-    annotations: READ_ONLY_ANNOTATIONS,
+    annotations: REVIEW_ANNOTATIONS,
   },
   async ({ base, files_filter, custom_instructions }) => {
     const cwd = getWorkspaceRoot();
@@ -877,15 +908,18 @@ server.registerTool(
     inputSchema: {
       branch: z
         .string()
+        .max(500)
+        .refine(v => !v.startsWith('-'), 'Must not start with a dash')
         .describe('Branch to review (e.g., "feature/my-change" or "origin/feature/my-change")'),
-      base: z.string().default('main').describe('Base branch to compare against (default: main)'),
-      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
+      base: z.string().max(500).default('main').refine(v => !v.startsWith('-'), 'Must not start with a dash').describe('Base branch to compare against (default: main)'),
+      review_type: z.string().max(500).default('general').describe(REVIEW_TYPE_DESC),
       custom_instructions: z
         .string()
+        .max(100_000)
         .optional()
         .describe('Additional review context (e.g., "This PR adds user authentication")'),
     },
-    annotations: READ_ONLY_ANNOTATIONS,
+    annotations: REVIEW_ANNOTATIONS,
   },
   async ({ branch, base, review_type, custom_instructions }) => {
     const cwd = getWorkspaceRoot();
@@ -933,7 +967,7 @@ server.registerTool(
       'Check if the auggie CLI is installed and authenticated. ' +
       'Returns version info, auth status, workspace path, and git repo status.',
     inputSchema: {},
-    annotations: READ_ONLY_ANNOTATIONS,
+    annotations: CHECK_ANNOTATIONS,
   },
   async () => {
     const lines: string[] = [];
@@ -1018,7 +1052,7 @@ server.registerTool(
       const hasCustomTypes = Object.keys(config.review_types || {}).length > 0;
       if (hasCustomTypes) {
         lines.push(
-          `Config: .auggie-review.json found (${Object.keys(config.review_types!).length} custom review types)`,
+          `Config: .auggie-review.json found (${Object.keys(config.review_types ?? {}).length} custom review types)`,
         );
       } else {
         lines.push('Config: using built-in defaults (no .auggie-review.json)');
