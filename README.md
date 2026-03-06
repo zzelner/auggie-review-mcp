@@ -230,6 +230,20 @@ Two review patterns:
 
 2. **Agentic delegation** (`review_branch_ref`): The MCP server gives auggie a short task instruction ("review branch X vs Y"). Auggie uses its own tools to fetch the diff, read files, and analyze code. This avoids context window limits on large PRs.
 
+## Security Model
+
+This server runs locally and spawns subprocesses. Understanding the trust boundaries helps you evaluate risk:
+
+**Trusted inputs:** The MCP client (Claude Code, Cursor, etc.) provides tool parameters. Since the client already has local code execution capability (via Bash/terminal tools), the MCP server operates within the same trust boundary.
+
+**Subprocess isolation:** All commands use `spawn` with `shell: false` — no shell injection is possible. Git refs and branch names are validated against flag injection (`--` prefixed values rejected). File paths are contained to the workspace root.
+
+**Cloud interaction:** Review tools send code to Augment's cloud API via the auggie CLI. Your code is processed by Augment's AI engine. Review Augment's privacy policy for data handling details.
+
+**Config trust:** `.auggie-review.json` is treated as trusted (same as `Makefile`, `package.json`, or any repo config). The `settings.auggie_bin` field controls which binary is executed — only use repos you trust.
+
+**Input limits:** All string inputs have length limits (500 chars for identifiers, 100KB for instructions). Output buffers are capped at 50MB. Subprocess timeout defaults to 15 minutes.
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |

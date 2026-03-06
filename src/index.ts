@@ -61,22 +61,8 @@ function getWorkspaceRoot(): string {
 // User Configuration (.auggie-review.json)
 // ============================================================================
 
-interface AuggieReviewConfig {
-  /** Custom or overridden review type prompts. Merged over built-in defaults. */
-  review_types?: Record<string, string>;
-  /** Settings overrides */
-  settings?: {
-    /** Subprocess timeout in milliseconds (default: 900000 = 15 min) */
-    timeout_ms?: number;
-    /** Max diff size in bytes before warning (default: 100000) */
-    max_diff_bytes?: number;
-    /** Path to auggie binary (default: "auggie") */
-    auggie_bin?: string;
-  };
-}
-
 const ConfigSchema = z.object({
-  review_types: z.record(z.string(), z.string()).optional(),
+  review_types: z.record(z.string(), z.string().min(1)).optional(),
   settings: z
     .object({
       timeout_ms: z.number().positive().optional(),
@@ -85,6 +71,8 @@ const ConfigSchema = z.object({
     })
     .optional(),
 });
+
+type AuggieReviewConfig = z.infer<typeof ConfigSchema>;
 
 let cachedConfig: AuggieReviewConfig | null = null;
 
@@ -628,7 +616,7 @@ server.registerTool(
     description:
       'Review uncommitted or staged git changes using Augment AI. ' +
       'Use this when reviewing local work before committing. No PR needed.',
-    inputSchema: {
+    inputSchema: z.object({
       diff_source: z
         .enum(['staged', 'unstaged', 'both'])
         .default('both')
@@ -640,6 +628,7 @@ server.registerTool(
       files_filter: z
         .string()
         .max(500)
+        .refine(v => !v.startsWith('-') && !v.startsWith(':('), 'Invalid pathspec')
         .optional()
         .describe('Git pathspec to filter files (e.g., "src/**/*.go", "lib/**/*.ts")'),
       custom_instructions: z
@@ -647,7 +636,7 @@ server.registerTool(
         .max(100_000)
         .optional()
         .describe('Additional review instructions to append to the prompt'),
-    },
+    }),
     annotations: REVIEW_ANNOTATIONS,
   },
   async ({ diff_source, review_type, files_filter, custom_instructions }) => {
@@ -685,12 +674,12 @@ server.registerTool(
       'Review all changes on the current branch compared to a base branch. ' +
       'Use this when you are already checked out on the feature branch. ' +
       'Requires being on the feature branch (not main). No PR needed.',
-    inputSchema: {
+    inputSchema: z.object({
       base: z.string().max(500).default('main').refine(v => !v.startsWith('-'), 'Must not start with a dash').describe('Base branch to compare against (default: main)'),
       review_type: z.string().max(500).default('general').describe(REVIEW_TYPE_DESC),
-      files_filter: z.string().max(500).optional().describe('Git pathspec to filter reviewed files'),
+      files_filter: z.string().max(500).refine(v => !v.startsWith('-') && !v.startsWith(':('), 'Invalid pathspec').optional().describe('Git pathspec to filter reviewed files'),
       custom_instructions: z.string().max(100_000).optional().describe('Additional review instructions'),
-    },
+    }),
     annotations: REVIEW_ANNOTATIONS,
   },
   async ({ base, review_type, files_filter, custom_instructions }) => {
@@ -735,10 +724,11 @@ server.registerTool(
       'Review specific files for quality, security, and pattern compliance. ' +
       'Use this for targeted review of specific files (full contents, not diffs). ' +
       'Use git_ref to review files from any branch/tag/commit without checking it out.',
-    inputSchema: {
+    inputSchema: z.object({
       paths: z
         .array(z.string().max(1000))
         .min(1)
+        .max(100)
         .describe('File paths to review (relative to workspace root)'),
       git_ref: z
         .string()
@@ -751,7 +741,7 @@ server.registerTool(
         ),
       review_type: z.string().max(500).default('general').describe(REVIEW_TYPE_DESC),
       custom_instructions: z.string().max(100_000).optional().describe('Additional review instructions'),
-    },
+    }),
     annotations: REVIEW_ANNOTATIONS,
   },
   async ({ paths, git_ref, review_type, custom_instructions }) => {
@@ -812,11 +802,11 @@ server.registerTool(
       'Use this as a final check before creating a pull request. ' +
       'Returns a structured report with PASS/FAIL verdict. ' +
       'Requires being on the feature branch.',
-    inputSchema: {
+    inputSchema: z.object({
       base: z.string().max(500).default('main').refine(v => !v.startsWith('-'), 'Must not start with a dash').describe('Base branch to compare against'),
-      files_filter: z.string().max(500).optional().describe('Git pathspec to filter files'),
+      files_filter: z.string().max(500).refine(v => !v.startsWith('-') && !v.startsWith(':('), 'Invalid pathspec').optional().describe('Git pathspec to filter files'),
       custom_instructions: z.string().max(100_000).optional().describe('Additional review instructions to include'),
-    },
+    }),
     annotations: REVIEW_ANNOTATIONS,
   },
   async ({ base, files_filter, custom_instructions }) => {
@@ -905,7 +895,7 @@ server.registerTool(
       'Use this to review a branch without needing to check it out. ' +
       'Delegates to auggie as an agentic task: auggie discovers changed files, ' +
       'reads code, and analyzes changes using its own tools. Works on large PRs.',
-    inputSchema: {
+    inputSchema: z.object({
       branch: z
         .string()
         .max(500)
@@ -918,7 +908,7 @@ server.registerTool(
         .max(100_000)
         .optional()
         .describe('Additional review context (e.g., "This PR adds user authentication")'),
-    },
+    }),
     annotations: REVIEW_ANNOTATIONS,
   },
   async ({ branch, base, review_type, custom_instructions }) => {
@@ -966,7 +956,7 @@ server.registerTool(
     description:
       'Check if the auggie CLI is installed and authenticated. ' +
       'Returns version info, auth status, workspace path, and git repo status.',
-    inputSchema: {},
+    inputSchema: z.object({}),
     annotations: CHECK_ANNOTATIONS,
   },
   async () => {
