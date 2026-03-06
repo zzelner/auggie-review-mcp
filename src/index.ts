@@ -30,15 +30,12 @@
  *   }
  */
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'child_process';
 import { readFile } from 'fs/promises';
 import { resolve as resolvePath } from 'path';
+import { z } from 'zod';
 
 // ============================================================================
 // Configuration
@@ -48,7 +45,6 @@ const DEFAULT_TIMEOUT_MS = 900_000; // 15 minutes
 const DEFAULT_MAX_DIFF_BYTES = 100_000; // ~100KB diff limit before warning
 const MAX_BUFFER_BYTES = 50 * 1024 * 1024; // 50MB max stdout/stderr accumulation
 const AUGGIE_BIN = process.env.AUGGIE_BIN || 'auggie';
-const VALID_DIFF_SOURCES = ['staged', 'unstaged', 'both'] as const;
 
 function getWorkspaceRoot(): string {
   const root = process.env.WORKSPACE_ROOT;
@@ -300,15 +296,12 @@ function getReviewPrompt(
   reviewType: string,
   config: AuggieReviewConfig,
 ): string {
-  // User overrides take precedence
   if (config.review_types?.[reviewType]) {
     return config.review_types[reviewType];
   }
-  // Built-in defaults
   if (isDefaultReviewType(reviewType)) {
     return DEFAULT_PROMPTS[reviewType];
   }
-  // Unknown type — fall back to general
   return DEFAULT_PROMPTS.general;
 }
 
@@ -326,13 +319,11 @@ function buildPrompt(
 
 /**
  * Review type hints for the agentic review_branch_ref tool.
- * These are short summaries — auggie gets the full prompt context from its own tools.
  */
 function getReviewHint(
   reviewType: string,
   config: AuggieReviewConfig,
 ): string {
-  // If user has a custom type, extract a hint from the first line
   if (config.review_types?.[reviewType]) {
     const firstLine = config.review_types[reviewType].split('\n')[0];
     return firstLine.length > 200 ? firstLine.slice(0, 200) + '...' : firstLine;
@@ -571,412 +562,255 @@ async function runReview(
 }
 
 // ============================================================================
-// Tool Definitions
+// Shared Annotations
 // ============================================================================
 
-const REVIEW_TYPE_DESCRIPTION =
+const READ_ONLY_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+} as const;
+
+// ============================================================================
+// Shared Schema Definitions
+// ============================================================================
+
+const REVIEW_TYPE_DESC =
   'Review focus. Built-in types: "general" (default), "security", "migration", ' +
-  '"api", "typescript", "component". Custom types can be defined in .auggie-review.json. ' +
+  '"api", "typescript", "component". Custom types via .auggie-review.json. ' +
   'Unknown types fall back to "general".';
 
-const TOOLS = [
+// ============================================================================
+// Server Setup (McpServer + registerTool)
+// ============================================================================
+
+const server = new McpServer({
+  name: 'auggie-review-mcp',
+  version: '1.0.0',
+});
+
+// ---------------------------------------------------------------------------
+// Tool 1: review_diff
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  'review_diff',
   {
-    name: 'review_diff',
+    title: 'Review Diff',
     description:
       'Review uncommitted or staged git changes using Augment AI. ' +
       'Use this when reviewing local work before committing. No PR needed.',
     inputSchema: {
-      type: 'object' as const,
-      properties: {
-        diff_source: {
-          type: 'string',
-          enum: ['staged', 'unstaged', 'both'],
-          default: 'both',
-          description:
-            'Which changes to review: "staged" (git diff --cached), ' +
-            '"unstaged" (git diff), or "both" (git diff HEAD)',
-        },
-        review_type: {
-          type: 'string',
-          default: 'general',
-          description: REVIEW_TYPE_DESCRIPTION,
-        },
-        files_filter: {
-          type: 'string',
-          description:
-            'Git pathspec to filter files (e.g., "src/**/*.go", "lib/**/*.ts")',
-        },
-        custom_instructions: {
-          type: 'string',
-          description:
-            'Additional review instructions to append to the prompt',
-        },
-      },
+      diff_source: z
+        .enum(['staged', 'unstaged', 'both'])
+        .default('both')
+        .describe(
+          'Which changes to review: "staged" (git diff --cached), ' +
+          '"unstaged" (git diff), or "both" (git diff HEAD)',
+        ),
+      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
+      files_filter: z
+        .string()
+        .optional()
+        .describe('Git pathspec to filter files (e.g., "src/**/*.go", "lib/**/*.ts")'),
+      custom_instructions: z
+        .string()
+        .optional()
+        .describe('Additional review instructions to append to the prompt'),
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
+  async ({ diff_source, review_type, files_filter, custom_instructions }) => {
+    const cwd = getWorkspaceRoot();
+    const config = await loadConfig(cwd);
+
+    const diff = await getGitDiff(cwd, diff_source, files_filter);
+
+    if (!diff.trim() || diff.trim().split('\n').length <= 1) {
+      return { content: [{ type: 'text', text: 'No changes found to review. Working tree is clean.' }] };
+    }
+
+    const maxBytes = getMaxDiffBytes(config);
+    let warning = '';
+    if (Buffer.byteLength(diff) > maxBytes) {
+      warning =
+        `WARNING: Diff is ${Math.round(Buffer.byteLength(diff) / 1024)}KB ` +
+        `(limit: ${maxBytes / 1024}KB). Consider using files_filter to narrow scope.\n\n`;
+    }
+
+    const result = await runReview(diff, review_type, custom_instructions, cwd, config);
+    return { content: [{ type: 'text', text: warning + result }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Tool 2: review_branch
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  'review_branch',
   {
-    name: 'review_branch',
+    title: 'Review Current Branch',
     description:
       'Review all changes on the current branch compared to a base branch. ' +
       'Use this when you are already checked out on the feature branch. ' +
       'Requires being on the feature branch (not main). No PR needed.',
     inputSchema: {
-      type: 'object' as const,
-      properties: {
-        base: {
-          type: 'string',
-          default: 'main',
-          description: 'Base branch to compare against (default: main)',
-        },
-        review_type: {
-          type: 'string',
-          default: 'general',
-          description: REVIEW_TYPE_DESCRIPTION,
-        },
-        files_filter: {
-          type: 'string',
-          description: 'Git pathspec to filter reviewed files',
-        },
-        custom_instructions: {
-          type: 'string',
-          description: 'Additional review instructions',
-        },
-      },
+      base: z.string().default('main').describe('Base branch to compare against (default: main)'),
+      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
+      files_filter: z.string().optional().describe('Git pathspec to filter reviewed files'),
+      custom_instructions: z.string().optional().describe('Additional review instructions'),
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
+  async ({ base, review_type, files_filter, custom_instructions }) => {
+    const cwd = getWorkspaceRoot();
+    const config = await loadConfig(cwd);
+
+    const currentBranch = await getCurrentBranch(cwd);
+    if (!currentBranch) {
+      return { content: [{ type: 'text', text: 'HEAD is detached — switch to a feature branch first.' }] };
+    }
+    if (currentBranch === base) {
+      return { content: [{ type: 'text', text: `Currently on ${base} — no branch diff to review. Switch to a feature branch first.` }] };
+    }
+
+    const diff = await getBranchDiff(cwd, base, files_filter);
+
+    if (!diff.trim() || diff.trim().split('\n').length <= 1) {
+      return { content: [{ type: 'text', text: `No differences found between ${base} and ${currentBranch}.` }] };
+    }
+
+    const header = `Branch: ${currentBranch} vs ${base}\n\n`;
+    const maxBytes = getMaxDiffBytes(config);
+    let warning = '';
+    if (Buffer.byteLength(diff) > maxBytes) {
+      warning = `WARNING: Diff is ${Math.round(Buffer.byteLength(diff) / 1024)}KB. Consider using files_filter to narrow scope.\n\n`;
+    }
+
+    const result = await runReview(diff, review_type, custom_instructions, cwd, config);
+    return { content: [{ type: 'text', text: header + warning + result }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Tool 3: review_files
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  'review_files',
   {
-    name: 'review_files',
+    title: 'Review Files',
     description:
       'Review specific files for quality, security, and pattern compliance. ' +
       'Use this for targeted review of specific files (full contents, not diffs). ' +
       'Use git_ref to review files from any branch/tag/commit without checking it out.',
     inputSchema: {
-      type: 'object' as const,
-      properties: {
-        paths: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'File paths to review (relative to workspace root)',
-        },
-        git_ref: {
-          type: 'string',
-          description:
-            'Git ref to read files from (e.g., "origin/feature-branch", "HEAD~3"). ' +
-            'Files are read via "git show ref:path" instead of from disk.',
-        },
-        review_type: {
-          type: 'string',
-          default: 'general',
-          description: REVIEW_TYPE_DESCRIPTION,
-        },
-        custom_instructions: {
-          type: 'string',
-          description: 'Additional review instructions',
-        },
-      },
-      required: ['paths'],
+      paths: z
+        .array(z.string())
+        .min(1)
+        .describe('File paths to review (relative to workspace root)'),
+      git_ref: z
+        .string()
+        .optional()
+        .describe(
+          'Git ref to read files from (e.g., "origin/feature-branch", "HEAD~3"). ' +
+          'Files are read via "git show ref:path" instead of from disk.',
+        ),
+      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
+      custom_instructions: z.string().optional().describe('Additional review instructions'),
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
+  async ({ paths, git_ref, review_type, custom_instructions }) => {
+    const cwd = getWorkspaceRoot();
+    const config = await loadConfig(cwd);
+
+    const fileContents: string[] = [];
+    let successCount = 0;
+    for (const filePath of paths) {
+      try {
+        let content: string;
+        if (git_ref) {
+          content = await getFileFromGitRef(cwd, git_ref, filePath);
+        } else {
+          const resolved = resolvePath(cwd, filePath);
+          if (!resolved.startsWith(resolvePath(cwd) + '/')) {
+            throw new Error(`Path outside workspace: ${filePath}`);
+          }
+          content = await readFile(resolved, 'utf-8');
+        }
+        fileContents.push(`--- ${filePath} ---\n${content}\n`);
+        successCount++;
+      } catch {
+        const source = git_ref ? `${git_ref}:${filePath}` : filePath;
+        fileContents.push(
+          `--- ${source} --- (ERROR: file not found or unreadable)\n`,
+        );
+      }
+    }
+
+    if (successCount === 0) {
+      return {
+        content: [{ type: 'text', text: `Error: none of the ${paths.length} file(s) could be read. Check that paths are relative to the workspace root.` }],
+        isError: true,
+      };
+    }
+
+    const combined = fileContents.join('\n');
+    const prompt = buildPrompt(review_type, config, custom_instructions);
+    const refNote = git_ref ? `\nReviewing files from git ref: ${git_ref}\n` : '';
+    const fullPrompt = `${prompt}${refNote}\n\nFiles to review:\n\n${combined}`;
+
+    const result = await runAuggieReview(fullPrompt, cwd, config);
+    return { content: [{ type: 'text', text: result }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Tool 4: review_pr_ready
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  'review_pr_ready',
   {
-    name: 'review_pr_ready',
+    title: 'Pre-PR Quality Gate',
     description:
       'Comprehensive pre-PR quality gate combining security and general review. ' +
       'Use this as a final check before creating a pull request. ' +
       'Returns a structured report with PASS/FAIL verdict. ' +
       'Requires being on the feature branch.',
     inputSchema: {
-      type: 'object' as const,
-      properties: {
-        base: {
-          type: 'string',
-          default: 'main',
-          description: 'Base branch to compare against',
-        },
-        files_filter: {
-          type: 'string',
-          description: 'Git pathspec to filter files',
-        },
-        custom_instructions: {
-          type: 'string',
-          description: 'Additional review instructions to include',
-        },
-      },
+      base: z.string().default('main').describe('Base branch to compare against'),
+      files_filter: z.string().optional().describe('Git pathspec to filter files'),
+      custom_instructions: z.string().optional().describe('Additional review instructions to include'),
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
-  {
-    name: 'review_branch_ref',
-    description:
-      'Review any branch or PR — the primary and most common review tool. ' +
-      'Use this to review a branch without needing to check it out. ' +
-      'Delegates to auggie as an agentic task: auggie discovers changed files, ' +
-      'reads code, and analyzes changes using its own tools. Works on large PRs.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        branch: {
-          type: 'string',
-          description:
-            'Branch to review (e.g., "feature/my-change" or "origin/feature/my-change")',
-        },
-        base: {
-          type: 'string',
-          default: 'main',
-          description: 'Base branch to compare against (default: main)',
-        },
-        review_type: {
-          type: 'string',
-          default: 'general',
-          description: REVIEW_TYPE_DESCRIPTION,
-        },
-        custom_instructions: {
-          type: 'string',
-          description:
-            'Additional review context (e.g., "This PR adds user authentication")',
-        },
-      },
-      required: ['branch'],
-    },
-  },
-  {
-    name: 'check_auth',
-    description:
-      'Check if the auggie CLI is installed and authenticated. ' +
-      'Returns version info, auth status, and workspace path.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {},
-    },
-  },
-];
+  async ({ base, files_filter, custom_instructions }) => {
+    const cwd = getWorkspaceRoot();
+    const config = await loadConfig(cwd);
 
-// ============================================================================
-// Tool Handlers
-// ============================================================================
-
-async function handleReviewDiff(
-  args: Record<string, unknown>,
-): Promise<string> {
-  const cwd = getWorkspaceRoot();
-  const config = await loadConfig(cwd);
-  const rawDiffSource =
-    typeof args.diff_source === 'string' ? args.diff_source : 'both';
-  if (!(VALID_DIFF_SOURCES as readonly string[]).includes(rawDiffSource)) {
-    return `Error: invalid diff_source "${rawDiffSource}". Must be one of: ${VALID_DIFF_SOURCES.join(', ')}`;
-  }
-  const diffSource = rawDiffSource;
-  const reviewType =
-    typeof args.review_type === 'string' ? args.review_type : 'general';
-  const filesFilter =
-    typeof args.files_filter === 'string' ? args.files_filter : undefined;
-  const customInstructions =
-    typeof args.custom_instructions === 'string'
-      ? args.custom_instructions
-      : undefined;
-
-  const diff = await getGitDiff(cwd, diffSource, filesFilter);
-
-  if (!diff.trim() || diff.trim().split('\n').length <= 1) {
-    return 'No changes found to review. Working tree is clean.';
-  }
-
-  const maxBytes = getMaxDiffBytes(config);
-  if (Buffer.byteLength(diff) > maxBytes) {
-    return (
-      `WARNING: Diff is ${Math.round(Buffer.byteLength(diff) / 1024)}KB ` +
-      `(limit: ${maxBytes / 1024}KB). Consider using files_filter to narrow scope.\n\n` +
-      'Proceeding with review of the full diff...\n\n' +
-      (await runReview(diff, reviewType, customInstructions, cwd, config))
-    );
-  }
-
-  return runReview(diff, reviewType, customInstructions, cwd, config);
-}
-
-async function handleReviewBranch(
-  args: Record<string, unknown>,
-): Promise<string> {
-  const cwd = getWorkspaceRoot();
-  const config = await loadConfig(cwd);
-  const base = typeof args.base === 'string' ? args.base : 'main';
-  const reviewType =
-    typeof args.review_type === 'string' ? args.review_type : 'general';
-  const filesFilter =
-    typeof args.files_filter === 'string' ? args.files_filter : undefined;
-  const customInstructions =
-    typeof args.custom_instructions === 'string'
-      ? args.custom_instructions
-      : undefined;
-
-  const currentBranch = await getCurrentBranch(cwd);
-  if (!currentBranch) {
-    return 'HEAD is detached — switch to a feature branch first.';
-  }
-  if (currentBranch === base) {
-    return `Currently on ${base} — no branch diff to review. Switch to a feature branch first.`;
-  }
-
-  const diff = await getBranchDiff(cwd, base, filesFilter);
-
-  if (!diff.trim() || diff.trim().split('\n').length <= 1) {
-    return `No differences found between ${base} and ${currentBranch}.`;
-  }
-
-  const header = `Branch: ${currentBranch} vs ${base}\n\n`;
-  const maxBytes = getMaxDiffBytes(config);
-
-  if (Buffer.byteLength(diff) > maxBytes) {
-    return (
-      header +
-      `WARNING: Diff is ${Math.round(Buffer.byteLength(diff) / 1024)}KB. ` +
-      'Consider using files_filter to narrow scope.\n\n' +
-      (await runReview(diff, reviewType, customInstructions, cwd, config))
-    );
-  }
-
-  return (
-    header + (await runReview(diff, reviewType, customInstructions, cwd, config))
-  );
-}
-
-async function handleReviewFiles(
-  args: Record<string, unknown>,
-): Promise<string> {
-  const cwd = getWorkspaceRoot();
-  const config = await loadConfig(cwd);
-  const reviewType =
-    typeof args.review_type === 'string' ? args.review_type : 'general';
-  const customInstructions =
-    typeof args.custom_instructions === 'string'
-      ? args.custom_instructions
-      : undefined;
-  const gitRef =
-    typeof args.git_ref === 'string' ? args.git_ref : undefined;
-
-  if (!Array.isArray(args.paths) || args.paths.length === 0) {
-    return 'Error: paths array is required and must not be empty.';
-  }
-  const paths = args.paths.filter((p): p is string => typeof p === 'string');
-  if (paths.length === 0) {
-    return 'Error: paths array must contain string values.';
-  }
-
-  const fileContents: string[] = [];
-  let successCount = 0;
-  for (const filePath of paths) {
-    try {
-      let content: string;
-      if (gitRef) {
-        content = await getFileFromGitRef(cwd, gitRef, filePath);
-      } else {
-        const resolved = resolvePath(cwd, filePath);
-        if (!resolved.startsWith(resolvePath(cwd) + '/')) {
-          throw new Error(`Path outside workspace: ${filePath}`);
-        }
-        content = await readFile(resolved, 'utf-8');
-      }
-      fileContents.push(`--- ${filePath} ---\n${content}\n`);
-      successCount++;
-    } catch {
-      const source = gitRef ? `${gitRef}:${filePath}` : filePath;
-      fileContents.push(
-        `--- ${source} --- (ERROR: file not found or unreadable)\n`,
-      );
+    const currentBranch = await getCurrentBranch(cwd);
+    if (!currentBranch) {
+      return { content: [{ type: 'text', text: 'HEAD is detached — switch to a feature branch first.' }] };
     }
-  }
+    if (currentBranch === base) {
+      return { content: [{ type: 'text', text: `Currently on ${base} — switch to a feature branch first.` }] };
+    }
 
-  if (successCount === 0) {
-    return `Error: none of the ${paths.length} file(s) could be read. Check that paths are relative to the workspace root.`;
-  }
+    const diff = await getBranchDiff(cwd, base, files_filter);
 
-  const combined = fileContents.join('\n');
-  const prompt = buildPrompt(reviewType, config, customInstructions);
-  const refNote = gitRef
-    ? `\nReviewing files from git ref: ${gitRef}\n`
-    : '';
-  const fullPrompt = `${prompt}${refNote}\n\nFiles to review:\n\n${combined}`;
+    if (!diff.trim() || diff.trim().split('\n').length <= 1) {
+      return { content: [{ type: 'text', text: `No differences found between ${base} and ${currentBranch}.` }] };
+    }
 
-  return runAuggieReview(fullPrompt, cwd, config);
-}
+    // Compose PR-ready prompt from user's configured review types
+    const securityPrompt = getReviewPrompt('security', config);
+    const generalPrompt = getReviewPrompt('general', config);
 
-async function handleReviewBranchRef(
-  args: Record<string, unknown>,
-): Promise<string> {
-  const cwd = getWorkspaceRoot();
-  const config = await loadConfig(cwd);
-  const branch = typeof args.branch === 'string' ? args.branch : '';
-  const base = typeof args.base === 'string' ? args.base : 'main';
-  const reviewType =
-    typeof args.review_type === 'string' ? args.review_type : 'general';
-  const customInstructions =
-    typeof args.custom_instructions === 'string'
-      ? args.custom_instructions
-      : undefined;
-
-  if (!branch) {
-    return 'Error: branch is required.';
-  }
-
-  // Detect repo from git remote
-  const remoteResult = await execCommand(
-    'git',
-    ['remote', 'get-url', 'origin'],
-    { cwd, timeout: 10_000 },
-  );
-  let repo = 'unknown/repo';
-  if (remoteResult.exitCode === 0) {
-    const repoMatch = remoteResult.stdout.trim().match(/[:/]([^/]+\/[^/]+?)(\.git)?$/);
-    if (repoMatch) repo = repoMatch[1];
-  }
-
-  const hint = getReviewHint(reviewType, config);
-  const customPart = customInstructions
-    ? ` Additional context: ${customInstructions}`
-    : '';
-
-  // Agentic delegation: give auggie a task, not a diff.
-  // Auggie uses its own tools to fetch the diff, read files, and analyze.
-  const instruction =
-    `Review the changes on branch "${branch}" compared to "${base}" ` +
-    `in ${repo}. Analyze all changed files. ${hint}${customPart} ` +
-    `Post your findings as a structured review with severity levels ` +
-    `(CRITICAL/HIGH/MEDIUM). Do not post comments to GitHub — just ` +
-    `output your review to stdout.`;
-
-  return runAuggieReview(instruction, cwd, config);
-}
-
-async function handleReviewPrReady(
-  args: Record<string, unknown>,
-): Promise<string> {
-  const cwd = getWorkspaceRoot();
-  const config = await loadConfig(cwd);
-  const base = typeof args.base === 'string' ? args.base : 'main';
-  const filesFilter =
-    typeof args.files_filter === 'string' ? args.files_filter : undefined;
-  const customInstructions =
-    typeof args.custom_instructions === 'string'
-      ? args.custom_instructions
-      : undefined;
-
-  const currentBranch = await getCurrentBranch(cwd);
-  if (!currentBranch) {
-    return 'HEAD is detached — switch to a feature branch first.';
-  }
-  if (currentBranch === base) {
-    return `Currently on ${base} — switch to a feature branch first.`;
-  }
-
-  const diff = await getBranchDiff(cwd, base, filesFilter);
-
-  if (!diff.trim() || diff.trim().split('\n').length <= 1) {
-    return `No differences found between ${base} and ${currentBranch}.`;
-  }
-
-  // Compose PR-ready prompt from user's configured review types
-  const securityPrompt = getReviewPrompt('security', config);
-  const generalPrompt = getReviewPrompt('general', config);
-
-  const prReadyPrompt = `You are performing a comprehensive pre-PR review.
+    const prReadyPrompt = `You are performing a comprehensive pre-PR review.
 This is the final quality gate before creating a pull request.
 
 Review this diff against ALL of the following criteria:
@@ -1014,171 +848,188 @@ Output a structured report:
 If there are zero critical findings, verdict is PASS or PASS WITH COMMENTS.
 If there are any critical findings, verdict is FAIL.`;
 
-  const customPart = customInstructions
-    ? `\n\n--- ADDITIONAL CONTEXT ---\n${customInstructions}`
-    : '';
+    const customPart = custom_instructions
+      ? `\n\n--- ADDITIONAL CONTEXT ---\n${custom_instructions}`
+      : '';
 
-  return runAuggieReview(`${prReadyPrompt}${customPart}\n\nDiff:\n\n${diff}`, cwd, config);
-}
-
-async function handleCheckAuth(): Promise<string> {
-  const lines: string[] = [];
-
-  // Check auggie binary
-  let auggieBin = AUGGIE_BIN;
-  try {
-    const cwd = getWorkspaceRoot();
-    const config = await loadConfig(cwd);
-    auggieBin = getAuggieBin(config);
-  } catch {
-    // WORKSPACE_ROOT not set — use default binary
-  }
-
-  try {
-    const versionResult = await execCommand(auggieBin, ['--version'], {
-      timeout: 10_000,
-    });
-    lines.push(`auggie CLI: installed (${versionResult.stdout.trim()})`);
-  } catch {
-    lines.push(
-      `auggie CLI: NOT FOUND at "${auggieBin}"\n` +
-        'Install with: npm install -g @augmentcode/auggie\n' +
-        'Then authenticate: auggie login',
+    const result = await runAuggieReview(
+      `${prReadyPrompt}${customPart}\n\nDiff:\n\n${diff}`,
+      cwd,
+      config,
     );
-    return lines.join('\n');
-  }
-
-  // Check auth with a trivial operation
-  let authCwd: string;
-  try {
-    authCwd = getWorkspaceRoot();
-  } catch {
-    authCwd = process.cwd();
-  }
-
-  try {
-    const testResult = await execCommand(
-      auggieBin,
-      [
-        '--print',
-        '--quiet',
-        '--max-turns',
-        '1',
-        'Say "auth OK" and nothing else.',
-      ],
-      { cwd: authCwd, timeout: 30_000 },
-    );
-    if (testResult.exitCode === 0) {
-      lines.push('Authentication: OK');
-    } else {
-      lines.push(
-        `Authentication: FAILED (exit code ${testResult.exitCode})\n` +
-          `Error: ${testResult.stderr || testResult.stdout}\n` +
-          'Run: auggie login',
-      );
-    }
-  } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    lines.push(`Authentication: ERROR — ${errMsg}`);
-  }
-
-  // Check workspace
-  try {
-    const root = getWorkspaceRoot();
-    lines.push(`Workspace: ${root}`);
-
-    // Check if workspace is a git repo
-    const gitCheck = await execCommand('git', ['rev-parse', '--is-inside-work-tree'], {
-      cwd: root,
-      timeout: 5_000,
-    });
-    if (gitCheck.exitCode === 0) {
-      lines.push('Git repository: YES');
-    } else {
-      lines.push('Git repository: NO (git-dependent tools will fail)');
-    }
-
-    // Check for config file
-    const config = await loadConfig(root);
-    const hasCustomTypes = Object.keys(config.review_types || {}).length > 0;
-    if (hasCustomTypes) {
-      lines.push(
-        `Config: .auggie-review.json found (${Object.keys(config.review_types!).length} custom review types)`,
-      );
-    } else {
-      lines.push('Config: using built-in defaults (no .auggie-review.json)');
-    }
-  } catch {
-    lines.push('Workspace: NOT SET (WORKSPACE_ROOT env var required)');
-  }
-
-  return lines.join('\n');
-}
-
-// ============================================================================
-// Server Setup
-// ============================================================================
-
-const server = new Server(
-  {
-    name: 'auggie-review-mcp',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
+    return { content: [{ type: 'text', text: result }] };
   },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
+// ---------------------------------------------------------------------------
+// Tool 5: review_branch_ref
+// ---------------------------------------------------------------------------
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  const safeArgs = (args || {}) as Record<string, unknown>;
+server.registerTool(
+  'review_branch_ref',
+  {
+    title: 'Review Branch',
+    description:
+      'Review any branch or PR — the primary and most common review tool. ' +
+      'Use this to review a branch without needing to check it out. ' +
+      'Delegates to auggie as an agentic task: auggie discovers changed files, ' +
+      'reads code, and analyzes changes using its own tools. Works on large PRs.',
+    inputSchema: {
+      branch: z
+        .string()
+        .describe('Branch to review (e.g., "feature/my-change" or "origin/feature/my-change")'),
+      base: z.string().default('main').describe('Base branch to compare against (default: main)'),
+      review_type: z.string().default('general').describe(REVIEW_TYPE_DESC),
+      custom_instructions: z
+        .string()
+        .optional()
+        .describe('Additional review context (e.g., "This PR adds user authentication")'),
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  async ({ branch, base, review_type, custom_instructions }) => {
+    const cwd = getWorkspaceRoot();
+    const config = await loadConfig(cwd);
 
-  try {
-    let result: string;
-
-    switch (name) {
-      case 'review_diff':
-        result = await handleReviewDiff(safeArgs);
-        break;
-      case 'review_branch':
-        result = await handleReviewBranch(safeArgs);
-        break;
-      case 'review_files':
-        result = await handleReviewFiles(safeArgs);
-        break;
-      case 'review_branch_ref':
-        result = await handleReviewBranchRef(safeArgs);
-        break;
-      case 'review_pr_ready':
-        result = await handleReviewPrReady(safeArgs);
-        break;
-      case 'check_auth':
-        result = await handleCheckAuth();
-        break;
-      default:
-        return {
-          content: [{ type: 'text' as const, text: `Unknown tool: ${name}` }],
-          isError: true,
-        };
+    // Detect repo from git remote
+    const remoteResult = await execCommand(
+      'git',
+      ['remote', 'get-url', 'origin'],
+      { cwd, timeout: 10_000 },
+    );
+    let repo = 'unknown/repo';
+    if (remoteResult.exitCode === 0) {
+      const repoMatch = remoteResult.stdout.trim().match(/[:/]([^/]+\/[^/]+?)(\.git)?$/);
+      if (repoMatch) repo = repoMatch[1];
     }
 
-    return {
-      content: [{ type: 'text' as const, text: result }],
-    };
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      content: [{ type: 'text' as const, text: `Error: ${message}` }],
-      isError: true,
-    };
-  }
-});
+    const hint = getReviewHint(review_type, config);
+    const customPart = custom_instructions
+      ? ` Additional context: ${custom_instructions}`
+      : '';
+
+    // Agentic delegation: give auggie a task, not a diff.
+    const instruction =
+      `Review the changes on branch "${branch}" compared to "${base}" ` +
+      `in ${repo}. Analyze all changed files. ${hint}${customPart} ` +
+      `Post your findings as a structured review with severity levels ` +
+      `(CRITICAL/HIGH/MEDIUM). Do not post comments to GitHub — just ` +
+      `output your review to stdout.`;
+
+    const result = await runAuggieReview(instruction, cwd, config);
+    return { content: [{ type: 'text', text: result }] };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Tool 6: check_auth
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  'check_auth',
+  {
+    title: 'Check Auth',
+    description:
+      'Check if the auggie CLI is installed and authenticated. ' +
+      'Returns version info, auth status, workspace path, and git repo status.',
+    inputSchema: {},
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  async () => {
+    const lines: string[] = [];
+
+    // Check auggie binary
+    let auggieBin = AUGGIE_BIN;
+    try {
+      const cwd = getWorkspaceRoot();
+      const config = await loadConfig(cwd);
+      auggieBin = getAuggieBin(config);
+    } catch {
+      // WORKSPACE_ROOT not set — use default binary
+    }
+
+    try {
+      const versionResult = await execCommand(auggieBin, ['--version'], {
+        timeout: 10_000,
+      });
+      lines.push(`auggie CLI: installed (${versionResult.stdout.trim()})`);
+    } catch {
+      lines.push(
+        `auggie CLI: NOT FOUND at "${auggieBin}"\n` +
+          'Install with: npm install -g @augmentcode/auggie\n' +
+          'Then authenticate: auggie login',
+      );
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    // Check auth with a trivial operation
+    let authCwd: string;
+    try {
+      authCwd = getWorkspaceRoot();
+    } catch {
+      authCwd = process.cwd();
+    }
+
+    try {
+      const testResult = await execCommand(
+        auggieBin,
+        [
+          '--print',
+          '--quiet',
+          '--max-turns',
+          '1',
+          'Say "auth OK" and nothing else.',
+        ],
+        { cwd: authCwd, timeout: 30_000 },
+      );
+      if (testResult.exitCode === 0) {
+        lines.push('Authentication: OK');
+      } else {
+        lines.push(
+          `Authentication: FAILED (exit code ${testResult.exitCode})\n` +
+            `Error: ${testResult.stderr || testResult.stdout}\n` +
+            'Run: auggie login',
+        );
+      }
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      lines.push(`Authentication: ERROR — ${errMsg}`);
+    }
+
+    // Check workspace
+    try {
+      const root = getWorkspaceRoot();
+      lines.push(`Workspace: ${root}`);
+
+      // Check if workspace is a git repo
+      const gitCheck = await execCommand(
+        'git',
+        ['rev-parse', '--is-inside-work-tree'],
+        { cwd: root, timeout: 5_000 },
+      );
+      if (gitCheck.exitCode === 0) {
+        lines.push('Git repository: YES');
+      } else {
+        lines.push('Git repository: NO (git-dependent tools will fail)');
+      }
+
+      // Check for config file
+      const config = await loadConfig(root);
+      const hasCustomTypes = Object.keys(config.review_types || {}).length > 0;
+      if (hasCustomTypes) {
+        lines.push(
+          `Config: .auggie-review.json found (${Object.keys(config.review_types!).length} custom review types)`,
+        );
+      } else {
+        lines.push('Config: using built-in defaults (no .auggie-review.json)');
+      }
+    } catch {
+      lines.push('Workspace: NOT SET (WORKSPACE_ROOT env var required)');
+    }
+
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  },
+);
 
 // ============================================================================
 // Main
