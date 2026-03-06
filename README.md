@@ -184,7 +184,8 @@ Create a `.auggie-review.json` in your repository root to customize or add revie
   },
   "settings": {
     "timeout_ms": 600000,
-    "max_diff_bytes": 200000
+    "max_diff_bytes": 200000,
+    "auggie_bin": "/usr/local/bin/auggie"
   }
 }
 ```
@@ -242,6 +243,29 @@ Both can also be set via `.auggie-review.json` settings.
 | `review_branch_ref` (small PR) | 2-4 minutes |
 | `review_branch_ref` (large PR, 20+ files) | 5-8 minutes |
 | Default timeout | 15 minutes |
+
+## Troubleshooting
+
+**"auggie: command not found"**
+Install the CLI: `npm install -g @augmentcode/auggie` (requires Node.js 22+)
+
+**"Authentication: FAILED"**
+Re-authenticate: `auggie login`. Sessions expire periodically.
+
+**"WORKSPACE_ROOT environment variable is required"**
+Add `WORKSPACE_ROOT` to your MCP server config's `env` block pointing to your repo root.
+
+**"Path outside workspace"**
+File paths in `review_files` must be relative to the workspace root. Don't use absolute paths or `../`.
+
+**Diff size warning**
+The default limit is 100KB. Use `files_filter` to narrow scope, or increase `max_diff_bytes` in `.auggie-review.json`.
+
+**Timeout errors on large PRs**
+Use `review_branch_ref` instead of `review_branch` — it delegates to auggie agentically and avoids context window limits. You can also increase `timeout_ms` in `.auggie-review.json`.
+
+**Reviews don't reflect config changes**
+Config is read once at startup. Restart your MCP client after editing `.auggie-review.json`.
 
 ## Development
 

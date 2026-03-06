@@ -46,7 +46,9 @@ import { resolve as resolvePath } from 'path';
 
 const DEFAULT_TIMEOUT_MS = 900_000; // 15 minutes
 const DEFAULT_MAX_DIFF_BYTES = 100_000; // ~100KB diff limit before warning
+const MAX_BUFFER_BYTES = 50 * 1024 * 1024; // 50MB max stdout/stderr accumulation
 const AUGGIE_BIN = process.env.AUGGIE_BIN || 'auggie';
+const VALID_DIFF_SOURCES = ['staged', 'unstaged', 'both'] as const;
 
 function getWorkspaceRoot(): string {
   const root = process.env.WORKSPACE_ROOT;
@@ -119,6 +121,10 @@ const DEFAULT_REVIEW_TYPES = [
 ] as const;
 
 type DefaultReviewType = (typeof DEFAULT_REVIEW_TYPES)[number];
+
+function isDefaultReviewType(value: string): value is DefaultReviewType {
+  return (DEFAULT_REVIEW_TYPES as readonly string[]).includes(value);
+}
 
 const DEFAULT_PROMPTS: Record<DefaultReviewType, string> = {
   general: `You are a senior software engineer performing a code review.
@@ -299,8 +305,8 @@ function getReviewPrompt(
     return config.review_types[reviewType];
   }
   // Built-in defaults
-  if (reviewType in DEFAULT_PROMPTS) {
-    return DEFAULT_PROMPTS[reviewType as DefaultReviewType];
+  if (isDefaultReviewType(reviewType)) {
+    return DEFAULT_PROMPTS[reviewType];
   }
   // Unknown type — fall back to general
   return DEFAULT_PROMPTS.general;
@@ -382,6 +388,7 @@ function execCommand(
 
     const proc = spawn(cmd, args, {
       cwd: options.cwd,
+      shell: false,
       signal: ac.signal,
       env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -389,13 +396,24 @@ function execCommand(
 
     let stdout = '';
     let stderr = '';
+    let truncated = false;
 
     proc.stdout.on('data', (data: Buffer) => {
+      if (truncated) return;
       stdout += data.toString();
+      if (stdout.length > MAX_BUFFER_BYTES) {
+        truncated = true;
+        ac.abort();
+      }
     });
 
     proc.stderr.on('data', (data: Buffer) => {
+      if (truncated) return;
       stderr += data.toString();
+      if (stderr.length > MAX_BUFFER_BYTES) {
+        truncated = true;
+        ac.abort();
+      }
     });
 
     if (options.stdin) {
@@ -429,46 +447,31 @@ function execCommand(
 // Git Helpers
 // ============================================================================
 
+function buildDiffArgs(diffSource: string): string[] {
+  switch (diffSource) {
+    case 'staged':
+      return ['diff', '--cached'];
+    case 'unstaged':
+      return ['diff'];
+    case 'both':
+    default:
+      return ['diff', 'HEAD'];
+  }
+}
+
 async function getGitDiff(
   cwd: string,
   diffSource: string,
   filesFilter?: string,
 ): Promise<string> {
-  const args = ['diff'];
+  const statArgs = [...buildDiffArgs(diffSource), '--stat', '--'];
+  if (filesFilter) statArgs.push(filesFilter);
+  const statResult = await execCommand('git', statArgs, { cwd });
 
-  switch (diffSource) {
-    case 'staged':
-      args.push('--cached');
-      break;
-    case 'unstaged':
-      break;
-    case 'both':
-    default:
-      args.push('HEAD');
-      break;
-  }
-
-  args.push('--stat', '--');
-  if (filesFilter) args.push(filesFilter);
-
-  const statResult = await execCommand('git', args, { cwd });
-
-  const diffArgs = ['diff'];
-  switch (diffSource) {
-    case 'staged':
-      diffArgs.push('--cached');
-      break;
-    case 'unstaged':
-      break;
-    case 'both':
-    default:
-      diffArgs.push('HEAD');
-      break;
-  }
-  diffArgs.push('--');
+  const diffArgs = [...buildDiffArgs(diffSource), '--'];
   if (filesFilter) diffArgs.push(filesFilter);
-
   const diffResult = await execCommand('git', diffArgs, { cwd });
+
   return `${statResult.stdout}\n\n${diffResult.stdout}`;
 }
 
@@ -501,11 +504,12 @@ async function getFileFromGitRef(
   return result.stdout;
 }
 
-async function getCurrentBranch(cwd: string): Promise<string> {
+async function getCurrentBranch(cwd: string): Promise<string | null> {
   const result = await execCommand('git', ['branch', '--show-current'], {
     cwd,
   });
-  return result.stdout.trim();
+  const branch = result.stdout.trim();
+  return branch || null; // null in detached HEAD state
 }
 
 // ============================================================================
@@ -572,14 +576,15 @@ async function runReview(
 
 const REVIEW_TYPE_DESCRIPTION =
   'Review focus. Built-in types: "general" (default), "security", "migration", ' +
-  '"api", "typescript", "component". Custom types can be defined in .auggie-review.json.';
+  '"api", "typescript", "component". Custom types can be defined in .auggie-review.json. ' +
+  'Unknown types fall back to "general".';
 
 const TOOLS = [
   {
     name: 'review_diff',
     description:
       'Review uncommitted or staged git changes using Augment AI. ' +
-      'Runs auggie on the git diff output. No PR needed.',
+      'Use this when reviewing local work before committing. No PR needed.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -613,7 +618,8 @@ const TOOLS = [
     name: 'review_branch',
     description:
       'Review all changes on the current branch compared to a base branch. ' +
-      'Equivalent to reviewing git diff base...HEAD. No PR needed.',
+      'Use this when you are already checked out on the feature branch. ' +
+      'Requires being on the feature branch (not main). No PR needed.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -642,7 +648,7 @@ const TOOLS = [
     name: 'review_files',
     description:
       'Review specific files for quality, security, and pattern compliance. ' +
-      'Reviews the full file contents, not just diffs. ' +
+      'Use this for targeted review of specific files (full contents, not diffs). ' +
       'Use git_ref to review files from any branch/tag/commit without checking it out.',
     inputSchema: {
       type: 'object' as const,
@@ -674,9 +680,10 @@ const TOOLS = [
   {
     name: 'review_pr_ready',
     description:
-      'Comprehensive pre-PR review combining security, types, and quality checks. ' +
+      'Comprehensive pre-PR quality gate combining security and general review. ' +
+      'Use this as a final check before creating a pull request. ' +
       'Returns a structured report with PASS/FAIL verdict. ' +
-      'Reviews the full branch diff against the base branch.',
+      'Requires being on the feature branch.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -689,16 +696,20 @@ const TOOLS = [
           type: 'string',
           description: 'Git pathspec to filter files',
         },
+        custom_instructions: {
+          type: 'string',
+          description: 'Additional review instructions to include',
+        },
       },
     },
   },
   {
     name: 'review_branch_ref',
     description:
-      'Review a remote branch or PR — the primary tool for code review. ' +
+      'Review any branch or PR — the primary and most common review tool. ' +
+      'Use this to review a branch without needing to check it out. ' +
       'Delegates to auggie as an agentic task: auggie discovers changed files, ' +
-      'reads code, and analyzes changes using its own tools. ' +
-      'No need to specify files — auggie discovers everything automatically.',
+      'reads code, and analyzes changes using its own tools. Works on large PRs.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -747,8 +758,12 @@ async function handleReviewDiff(
 ): Promise<string> {
   const cwd = getWorkspaceRoot();
   const config = await loadConfig(cwd);
-  const diffSource =
+  const rawDiffSource =
     typeof args.diff_source === 'string' ? args.diff_source : 'both';
+  if (!(VALID_DIFF_SOURCES as readonly string[]).includes(rawDiffSource)) {
+    return `Error: invalid diff_source "${rawDiffSource}". Must be one of: ${VALID_DIFF_SOURCES.join(', ')}`;
+  }
+  const diffSource = rawDiffSource;
   const reviewType =
     typeof args.review_type === 'string' ? args.review_type : 'general';
   const filesFilter =
@@ -793,6 +808,9 @@ async function handleReviewBranch(
       : undefined;
 
   const currentBranch = await getCurrentBranch(cwd);
+  if (!currentBranch) {
+    return 'HEAD is detached — switch to a feature branch first.';
+  }
   if (currentBranch === base) {
     return `Currently on ${base} — no branch diff to review. Switch to a feature branch first.`;
   }
@@ -843,6 +861,7 @@ async function handleReviewFiles(
   }
 
   const fileContents: string[] = [];
+  let successCount = 0;
   for (const filePath of paths) {
     try {
       let content: string;
@@ -856,12 +875,17 @@ async function handleReviewFiles(
         content = await readFile(resolved, 'utf-8');
       }
       fileContents.push(`--- ${filePath} ---\n${content}\n`);
+      successCount++;
     } catch {
       const source = gitRef ? `${gitRef}:${filePath}` : filePath;
       fileContents.push(
         `--- ${source} --- (ERROR: file not found or unreadable)\n`,
       );
     }
+  }
+
+  if (successCount === 0) {
+    return `Error: none of the ${paths.length} file(s) could be read. Check that paths are relative to the workspace root.`;
   }
 
   const combined = fileContents.join('\n');
@@ -898,9 +922,11 @@ async function handleReviewBranchRef(
     ['remote', 'get-url', 'origin'],
     { cwd, timeout: 10_000 },
   );
-  const remoteUrl = remoteResult.stdout.trim();
-  const repoMatch = remoteUrl.match(/[:/]([^/]+\/[^/]+?)(\.git)?$/);
-  const repo = repoMatch ? repoMatch[1] : 'unknown/repo';
+  let repo = 'unknown/repo';
+  if (remoteResult.exitCode === 0) {
+    const repoMatch = remoteResult.stdout.trim().match(/[:/]([^/]+\/[^/]+?)(\.git)?$/);
+    if (repoMatch) repo = repoMatch[1];
+  }
 
   const hint = getReviewHint(reviewType, config);
   const customPart = customInstructions
@@ -927,8 +953,15 @@ async function handleReviewPrReady(
   const base = typeof args.base === 'string' ? args.base : 'main';
   const filesFilter =
     typeof args.files_filter === 'string' ? args.files_filter : undefined;
+  const customInstructions =
+    typeof args.custom_instructions === 'string'
+      ? args.custom_instructions
+      : undefined;
 
   const currentBranch = await getCurrentBranch(cwd);
+  if (!currentBranch) {
+    return 'HEAD is detached — switch to a feature branch first.';
+  }
   if (currentBranch === base) {
     return `Currently on ${base} — switch to a feature branch first.`;
   }
@@ -939,34 +972,23 @@ async function handleReviewPrReady(
     return `No differences found between ${base} and ${currentBranch}.`;
   }
 
+  // Compose PR-ready prompt from user's configured review types
+  const securityPrompt = getReviewPrompt('security', config);
+  const generalPrompt = getReviewPrompt('general', config);
+
   const prReadyPrompt = `You are performing a comprehensive pre-PR review.
 This is the final quality gate before creating a pull request.
 
 Review this diff against ALL of the following criteria:
 
-### 1. Security (CRITICAL — blocks PR)
-- Authentication checks present on all protected endpoints
-- No hardcoded secrets or credentials
-- Input validation on user-provided data
-- Data access properly scoped
+--- SECURITY REVIEW ---
+${securityPrompt}
 
-### 2. Type Safety (CRITICAL)
-- No unsafe type assertions or \`any\` types
-- Functions have explicit return types
-- Null/undefined handled properly
+--- GENERAL CODE REVIEW ---
+${generalPrompt}
 
-### 3. Code Quality (HIGH)
-- No unused variables/imports
-- Error handling on async operations
-- Functions are focused and reasonably sized
-- No console.log in production code
-
-### 4. Architecture (MEDIUM)
-- Follows existing codebase conventions
-- No unnecessary code duplication
-- Proper separation of concerns
-
-### 5. Testing Indicators
+--- ADDITIONAL CHECKS ---
+### Testing Indicators
 - Do the changes suggest missing tests?
 - Are there edge cases not covered?
 
@@ -992,7 +1014,11 @@ Output a structured report:
 If there are zero critical findings, verdict is PASS or PASS WITH COMMENTS.
 If there are any critical findings, verdict is FAIL.`;
 
-  return runAuggieReview(`${prReadyPrompt}\n\nDiff:\n\n${diff}`, cwd, config);
+  const customPart = customInstructions
+    ? `\n\n--- ADDITIONAL CONTEXT ---\n${customInstructions}`
+    : '';
+
+  return runAuggieReview(`${prReadyPrompt}${customPart}\n\nDiff:\n\n${diff}`, cwd, config);
 }
 
 async function handleCheckAuth(): Promise<string> {
@@ -1023,6 +1049,13 @@ async function handleCheckAuth(): Promise<string> {
   }
 
   // Check auth with a trivial operation
+  let authCwd: string;
+  try {
+    authCwd = getWorkspaceRoot();
+  } catch {
+    authCwd = process.cwd();
+  }
+
   try {
     const testResult = await execCommand(
       auggieBin,
@@ -1033,16 +1066,7 @@ async function handleCheckAuth(): Promise<string> {
         '1',
         'Say "auth OK" and nothing else.',
       ],
-      {
-        cwd: (() => {
-          try {
-            return getWorkspaceRoot();
-          } catch {
-            return process.cwd();
-          }
-        })(),
-        timeout: 30_000,
-      },
+      { cwd: authCwd, timeout: 30_000 },
     );
     if (testResult.exitCode === 0) {
       lines.push('Authentication: OK');
@@ -1062,6 +1086,17 @@ async function handleCheckAuth(): Promise<string> {
   try {
     const root = getWorkspaceRoot();
     lines.push(`Workspace: ${root}`);
+
+    // Check if workspace is a git repo
+    const gitCheck = await execCommand('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: root,
+      timeout: 5_000,
+    });
+    if (gitCheck.exitCode === 0) {
+      lines.push('Git repository: YES');
+    } else {
+      lines.push('Git repository: NO (git-dependent tools will fail)');
+    }
 
     // Check for config file
     const config = await loadConfig(root);
