@@ -38,7 +38,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'child_process';
 import { readFile } from 'fs/promises';
-import { resolve } from 'path';
+import { resolve as resolvePath } from 'path';
 
 // ============================================================================
 // Configuration
@@ -82,7 +82,7 @@ let cachedConfig: AuggieReviewConfig | null = null;
 async function loadConfig(workspaceRoot: string): Promise<AuggieReviewConfig> {
   if (cachedConfig) return cachedConfig;
 
-  const configPath = resolve(workspaceRoot, '.auggie-review.json');
+  const configPath = resolvePath(workspaceRoot, '.auggie-review.json');
   try {
     const raw = await readFile(configPath, 'utf-8');
     cachedConfig = JSON.parse(raw) as AuggieReviewConfig;
@@ -94,15 +94,15 @@ async function loadConfig(workspaceRoot: string): Promise<AuggieReviewConfig> {
 }
 
 function getTimeoutMs(config: AuggieReviewConfig): number {
-  return config.settings?.timeout_ms || DEFAULT_TIMEOUT_MS;
+  return config.settings?.timeout_ms ?? DEFAULT_TIMEOUT_MS;
 }
 
 function getMaxDiffBytes(config: AuggieReviewConfig): number {
-  return config.settings?.max_diff_bytes || DEFAULT_MAX_DIFF_BYTES;
+  return config.settings?.max_diff_bytes ?? DEFAULT_MAX_DIFF_BYTES;
 }
 
 function getAuggieBin(config: AuggieReviewConfig): string {
-  return config.settings?.auggie_bin || AUGGIE_BIN;
+  return config.settings?.auggie_bin ?? AUGGIE_BIN;
 }
 
 // ============================================================================
@@ -845,9 +845,16 @@ async function handleReviewFiles(
   const fileContents: string[] = [];
   for (const filePath of paths) {
     try {
-      const content = gitRef
-        ? await getFileFromGitRef(cwd, gitRef, filePath)
-        : await readFile(resolve(cwd, filePath), 'utf-8');
+      let content: string;
+      if (gitRef) {
+        content = await getFileFromGitRef(cwd, gitRef, filePath);
+      } else {
+        const resolved = resolvePath(cwd, filePath);
+        if (!resolved.startsWith(resolvePath(cwd) + '/')) {
+          throw new Error(`Path outside workspace: ${filePath}`);
+        }
+        content = await readFile(resolved, 'utf-8');
+      }
       fileContents.push(`--- ${filePath} ---\n${content}\n`);
     } catch {
       const source = gitRef ? `${gitRef}:${filePath}` : filePath;
@@ -1120,7 +1127,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = await handleCheckAuth();
         break;
       default:
-        result = `Unknown tool: ${name}`;
+        return {
+          content: [{ type: 'text' as const, text: `Unknown tool: ${name}` }],
+          isError: true,
+        };
     }
 
     return {

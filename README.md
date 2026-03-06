@@ -189,6 +189,7 @@ Create a `.auggie-review.json` in your repository root to customize or add revie
 }
 ```
 
+- **Config is read once at startup** — restart your MCP client after editing `.auggie-review.json`
 - **Override built-in types** by using the same key (`general`, `security`, etc.)
 - **Add custom types** by using any new key (`django`, `graphql`, `rust`, etc.)
 - Built-in defaults are used for any type not specified in your config
